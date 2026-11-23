@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Moonlit Hop — a one-prompt game</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b1026; height: 100%; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="540" height="960"></canvas>
+<script>
+'use strict';
+// MOONLIT HOP — built from one prompt (see PROMPT.txt):
+// a tiny frog hops lily pad to lily pad across a moonlit pond, catching
+// fireflies. Hold to charge the hop, release to leap. Miss a pad: splash.
+
+const W = 540, H = 960;
+const WATER_Y = 806;          // top edge of the water
+const GRAV = 1500;            // px / s^2
+const HOP_VY = -705;          // fixed vertical hop speed
+const HOP_VX_MIN = 55, HOP_VX_MAX = 492; // horizontal speed by charge
+const CHARGE_TIME = 0.85;     // seconds of holding for a full charge
+const RUN_TIME = 45;          // seconds until the moon sets
+
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+
+// ---------- world state ----------
+let pads = [];        // {x, y, r, flower}
+let flies = [];       // {pad, dx, dy, phase, taken}
+let stars = [];
+let ripples = [];     // {x, y, r, a}
+let sparks = [];      // splash / collect particles {x,y,vx,vy,life,color,size}
+let camX = 0;
+let timeLeft = RUN_TIME;
+let score = 0, hops = 0, best = 0;
+let state = 'ready';  // ready | charging | flying | over
+let overWhy = '';
+let tGlobal = 0;
+
+const frog = { x: 0, y: 0, vx: 0, vy: 0, pad: 0, charge: 0, face: 1, squash: 0 };
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+
+function makePad(x) {
+  const prev = pads[pads.length - 1];
+  const y = prev ? Math.max(612, Math.min(758, prev.y + rand(-64, 64))) : 716;
+  const pad = { x, y, r: rand(40, 55), flower: Math.random() < 0.22 };
+  pads.push(pad);
+  if (pads.length > 1) {
+    flies.push({ pad: pads.length - 1, dx: rand(-14, 14), dy: rand(-128, -84),
+                 phase: rand(0, Math.PI * 2), taken: false });
+  }
+  return pad;
+}
+
+function reset() {
+  pads = []; flies = []; ripples = []; sparks = [];
+  const first = makePad(118);
+  makePad(118 + 168);
+  while (pads[pads.length - 1].x < 1600) {
+    const p = pads[pads.length - 1];
+    makePad(p.x + rand(118, 268));
+  }
+  frog.x = first.x; frog.y = first.y; frog.vx = 0; frog.vy = 0;
+  frog.pad = 0; frog.charge = 0; frog.squash = 0;
+  camX = 0; timeLeft = RUN_TIME; score = 0; hops = 0;
+  state = 'ready'; overWhy = '';
+}
+
+for (let i = 0; i < 90; i++) {
+  stars.push({ x: Math.random() * 2400, y: Math.random() * 560,
+               r: rand(0.7, 2.1), tw: rand(0, Math.PI * 2) });
+}
+
+// ---------- input ----------
+let holding = false;
+function press() {
+  if (state === 'over') { reset(); return; }
+  if (state === 'ready') { holding = true; state = 'charging'; frog.charge = 0; }
+}
+function release() {
+  if (state !== 'charging') return;
+  holding = false;
+  const c = frog.charge;
+  frog.vx = HOP_VX_MIN + c * (HOP_VX_MAX - HOP_VX_MIN);
+  frog.vy = HOP_VY;
+  frog.charge = 0;
+  state = 'flying';
+}
+addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) press(); }
+});
+addEventListener('keyup', e => { if (e.code === 'Space') release(); });
+cv.addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+addEventListener('pointerup', () => release());
+
+// ---------- physics ----------
+function landOn(padIdx) {
+  const pad = pads[padIdx];
+  frog.pad = padIdx;
+  frog.x = pad.x; frog.y = pad.y;
+  frog.vx = 0; frog.vy = 0;
+  frog.squash = 1;
+  state = 'ready';
+  hops++;
+  ripples.push({ x: pad.x, y: WATER_Y + 26, r: 8, a: 0.55 });
+  // make sure there is always pond ahead
+  while (pads[pads.length - 1].x < frog.x + 1500) {
+    const p = pads[pads.length - 1];
+    makePad(p.x + rand(118, 268));
+  }
+}
+
+function splash() {
+  state = 'over';
+  overWhy = 'SPLASH!';
+  best = Math.max(best, score);
+  for (let i = 0; i < 26; i++) {
+    sparks.push({ x: frog.x + rand(-8, 8), y: WATER_Y + 8,
+                  vx: rand(-130, 130), vy: rand(-330, -60),
+                  life: rand(0.4, 0.9), color: '#bfe3ff', size: rand(2, 4.5) });
+  }
+  ripples.push({ x: frog.x, y: WATER_Y + 26, r: 10, a: 0.8 });
+}
+
+function step(dt) {
+  tGlobal += dt;
+  if (state === 'charging') {
+    frog.charge = Math.min(1, frog.charge + dt / CHARGE_TIME);
+    frog.squash = Math.min(1, frog.squash + dt * 5);
+  } else {
+    frog.squash = Math.max(0, frog.squash - dt * 6);
+  }
+  if (state === 'flying') {
+    frog.x += frog.vx * dt;
+    frog.y += frog.vy * dt;
+    frog.vy += GRAV * dt;
+    // fireflies drift close to their pad; flying through one catches it
+    for (const f of flies) {
+      if (f.taken) continue;
+      const p = pads[f.pad];
+      const fx = p.x + f.dx + Math.sin(tGlobal * 1.7 + f.phase) * 9;
+      const fy = p.y + f.dy + Math.cos(tGlobal * 2.3 + f.phase) * 7;
+      if (Math.hypot(frog.x - fx, frog.y - 18 - fy) < 42) {
+        f.taken = true; score += 10;
+        for (let i = 0; i < 10; i++) {
+          sparks.push({ x: fx, y: fy, vx: rand(-60, 60), vy: rand(-60, 60),
+                        life: rand(0.25, 0.55), color: '#ffe066', size: rand(1.6, 3.2) });
+        }
+      }
+    }
+    // landing: falling, feet reach a pad top, horizontally over the pad
+    if (frog.vy > 0) {
+      for (let i = 0; i < pads.length; i++) {
+        const p = pads[i];
+        if (Math.abs(frog.x - p.x) < p.r * 0.92 && Math.abs(frog.y - p.y) < 15) {
+          landOn(i); break;
+        }
+      }
+    }
+    if (state === 'flying' && frog.y > WATER_Y + 34) splash();
+  }
+  if ((state === 'ready' || state === 'charging' || state === 'flying') && state !== 'over') {
+    timeLeft -= dt;
+    if (timeLeft <= 0) {
+      timeLeft = 0; state = 'over'; overWhy = 'THE MOON HAS SET';
+      best = Math.max(best, score);
+    }
+  }
+  // camera eases toward the frog
+  const target = Math.max(0, frog.x - 168);
+  camX += (target - camX) * Math.min(1, dt * 5);
+  // particles + ripples
+  for (const s of sparks) { s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 500 * dt; s.life -= dt; }
+  sparks = sparks.filter(s => s.life > 0);
+  for (const r of ripples) { r.r += 46 * dt; r.a -= dt * 0.7; }
+  ripples = ripples.filter(r => r.a > 0);
+}
+
+// ---------- drawing ----------
+function drawPad(p) {
+  const x = p.x - camX, y = p.y;
+  ctx.fillStyle = 'rgba(6,40,30,0.35)';
+  ctx.beginPath(); ctx.ellipse(x, WATER_Y + 30, p.r * 1.15, 10, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#1f7a44';
+  ctx.beginPath(); ctx.ellipse(x, y + 5, p.r, p.r * 0.34, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#2fa35c';
+  ctx.beginPath(); ctx.ellipse(x, y, p.r, p.r * 0.34, 0, 0, Math.PI * 2); ctx.fill();
+  // the classic lily-pad notch: a slim wedge of rim colour from centre to edge
+  ctx.fillStyle = '#1f7a44';
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + p.r + 2, y - p.r * 0.13);
+  ctx.lineTo(x + p.r + 2, y + p.r * 0.13);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#3fba6d';
+  ctx.beginPath(); ctx.ellipse(x - p.r * 0.2, y - 3, p.r * 0.55, p.r * 0.16, 0, 0, Math.PI * 2); ctx.fill();
+  if (p.flower) {
+    ctx.fillStyle = '#ff9ecb';
+    for (let k = 0; k < 5; k++) {
+      const a = (k / 5) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.ellipse(x + p.r * 0.45 + Math.cos(a) * 6, y - 6 + Math.sin(a) * 4, 6, 4, a, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = '#ffd94d';
+    ctx.beginPath(); ctx.arc(x + p.r * 0.45, y - 6, 3.4, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawFrog() {
+  const x = frog.x - camX, y = frog.y;
+  const sq = frog.squash;
+  const w = 30 * (1 + sq * 0.25), h = 24 * (1 - sq * 0.3);
+  ctx.save();
+  ctx.translate(x, y);
+  if (state === 'flying') ctx.rotate(Math.max(-0.38, Math.min(0.52, frog.vy / 1500)));
+  // legs
+  ctx.fillStyle = '#3f9e4d';
+  ctx.beginPath(); ctx.ellipse(-w * 0.62, -3, 10, 6, -0.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(w * 0.62, -3, 10, 6, 0.5, 0, Math.PI * 2); ctx.fill();
+  // body
+  ctx.fillStyle = '#5cc75a';
+  ctx.beginPath(); ctx.ellipse(0, -h / 2 - 2, w / 2, h / 2, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#d9f2c2';
+  ctx.beginPath(); ctx.ellipse(0, -h / 2 + 3, w * 0.28, h * 0.26, 0, 0, Math.PI * 2); ctx.fill();
+  // eyes
+  for (const s of [-1, 1]) {
+    ctx.fillStyle = '#5cc75a';
+    ctx.beginPath(); ctx.arc(s * 10, -h - 3 + sq * 4, 7.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(s * 10, -h - 3 + sq * 4, 5.6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#14210f';
+    ctx.beginPath(); ctx.arc(s * 10 + 2.2, -h - 3 + sq * 4, 2.8, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+  // charge bar
+  if (state === 'charging') {
+    const bw = 74;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(x - bw / 2, y - 78, bw, 10);
+    ctx.fillStyle = frog.charge < 0.6 ? '#7be495' : frog.charge < 0.9 ? '#ffd94d' : '#ff7a59';
+    ctx.fillRect(x - bw / 2 + 2, y - 76, (bw - 4) * frog.charge, 6);
+  }
+}
+
+function draw() {
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#0a0f2a'); sky.addColorStop(0.55, '#18295a'); sky.addColorStop(1, '#0d2148');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+  // stars
+  for (const s of stars) {
+    const sx = ((s.x - camX * 0.3) % (W + 40) + W + 40) % (W + 40) - 20;
+    ctx.globalAlpha = 0.45 + 0.4 * Math.sin(tGlobal * 1.4 + s.tw);
+    ctx.fillStyle = '#dfe9ff';
+    ctx.beginPath(); ctx.arc(sx, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // moon — sinks as the run timer runs out
+  const moonY = 118 + (1 - timeLeft / RUN_TIME) * 190;
+  ctx.fillStyle = 'rgba(240,244,190,0.16)';
+  ctx.beginPath(); ctx.arc(448, moonY, 66, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#f4f0c8';
+  ctx.beginPath(); ctx.arc(448, moonY, 44, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = 'rgba(190,190,150,0.5)';
+  ctx.beginPath(); ctx.arc(432, moonY - 10, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(462, moonY + 14, 6, 0, Math.PI * 2); ctx.fill();
+  // distant reeds
+  ctx.fillStyle = '#0e2c22';
+  for (let i = 0; i < 14; i++) {
+    const rx = ((i * 173 - camX * 0.55) % (W + 80) + W + 80) % (W + 80) - 40;
+    ctx.fillRect(rx, WATER_Y - 46 - (i % 4) * 9, 5, 60);
+  }
+  // water
+  const wat = ctx.createLinearGradient(0, WATER_Y, 0, H);
+  wat.addColorStop(0, '#17406e'); wat.addColorStop(1, '#081a36');
+  ctx.fillStyle = wat; ctx.fillRect(0, WATER_Y, W, H - WATER_Y);
+  // moonlight: a soft shimmering column under the moon
+  ctx.fillStyle = 'rgba(244,240,200,0.05)';
+  for (let row = 0; row < 6; row++) {
+    const ww = 120 - row * 9 + Math.sin(tGlobal * 2 + row * 1.3) * 10;
+    ctx.fillRect(448 - ww / 2, WATER_Y + 12 + row * 24, ww, 7);
+  }
+  ctx.strokeStyle = 'rgba(160,210,255,0.20)';
+  ctx.lineWidth = 2;
+  for (let row = 0; row < 5; row++) {
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += 14) {
+      const yy = WATER_Y + 18 + row * 27 + Math.sin(x * 0.045 + tGlobal * 1.6 + row * 1.7) * 3;
+      x === 0 ? ctx.moveTo(x, yy) : ctx.lineTo(x, yy);
+    }
+    ctx.stroke();
+  }
+  // ripples
+  for (const r of ripples) {
+    ctx.strokeStyle = `rgba(190,225,255,${Math.max(0, r.a)})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.ellipse(r.x - camX, r.y, r.r, r.r * 0.3, 0, 0, Math.PI * 2); ctx.stroke();
+  }
+  // pads + fireflies
+  for (const p of pads) if (p.x - camX > -90 && p.x - camX < W + 90) drawPad(p);
+  for (const f of flies) {
+    if (f.taken) continue;
+    const p = pads[f.pad];
+    const fx = p.x - camX + f.dx + Math.sin(tGlobal * 1.7 + f.phase) * 9;
+    const fy = p.y + f.dy + Math.cos(tGlobal * 2.3 + f.phase) * 7;
+    if (fx < -20 || fx > W + 20) continue;
+    const glow = 10 + Math.sin(tGlobal * 5 + f.phase) * 3.5;
+    ctx.fillStyle = 'rgba(255,224,102,0.22)';
+    ctx.beginPath(); ctx.arc(fx, fy, glow, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ffe066';
+    ctx.beginPath(); ctx.arc(fx, fy, 3.6, 0, Math.PI * 2); ctx.fill();
+  }
+  drawFrog();
+  // particles
+  for (const s of sparks) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, s.life * 2.4));
+    ctx.fillStyle = s.color;
+    ctx.beginPath(); ctx.arc(s.x - camX, s.y, s.size, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // HUD
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '700 30px system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('★ ' + score, 22, 46);
+  ctx.font = '600 17px system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.fillText('hops ' + hops, 22, 74);
+  // time bar
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
+  ctx.fillRect(22, 88, 200, 8);
+  ctx.fillStyle = '#ffd94d';
+  ctx.fillRect(22, 88, 200 * (timeLeft / RUN_TIME), 8);
+  // overlays
+  ctx.textAlign = 'center';
+  if (state === 'ready' && hops === 0 && score === 0) {
+    ctx.fillStyle = 'rgba(4,8,24,0.45)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 54px system-ui, sans-serif';
+    ctx.fillText('MOONLIT HOP', W / 2, 300);
+    ctx.font = '600 22px system-ui, sans-serif';
+    ctx.fillStyle = '#ffe066';
+    ctx.fillText('one prompt. one button. one frog.', W / 2, 344);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '600 24px system-ui, sans-serif';
+    ctx.fillText('HOLD to charge the hop', W / 2, 420);
+    ctx.fillText('RELEASE to leap', W / 2, 452);
+    ctx.font = '500 19px system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fillText('catch the fireflies — miss a pad and you splash', W / 2, 492);
+  }
+  if (state === 'over') {
+    ctx.fillStyle = 'rgba(4,8,24,0.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 50px system-ui, sans-serif';
+    ctx.fillText(overWhy, W / 2, 330);
+    ctx.font = '700 34px system-ui, sans-serif';
+    ctx.fillStyle = '#ffe066';
+    ctx.fillText('score ' + score, W / 2, 396);
+    ctx.font = '600 21px system-ui, sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('best ' + best + '  ·  ' + hops + ' hops', W / 2, 434);
+    ctx.font = '500 20px system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText('press SPACE or tap to hop again', W / 2, 486);
+  }
+  ctx.textAlign = 'left';
+}
+
+// ---------- loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  if (state !== 'over') {
+    step(dt);
+  } else {
+    // the run is done, but the pond stays alive: splash drops keep falling
+    tGlobal += dt;
+    for (const s of sparks) { s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 500 * dt; s.life -= dt; }
+    sparks = sparks.filter(s => s.life > 0);
+    for (const r of ripples) { r.r += 46 * dt; r.a -= dt * 0.7; }
+    ripples = ripples.filter(r => r.a > 0);
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+reset();
+requestAnimationFrame(frame);
+
+// Test / capture hooks: the video script reads these to aim its hops.
+window.__hop = {
+  frog, pads,
+  get state() { return state; },
+  get score() { return score; },
+  tune: { GRAV, HOP_VY, HOP_VX_MIN, HOP_VX_MAX, CHARGE_TIME },
+  // charge (0..1) that lands the frog on the next pad, from the game's physics
+  aim() {
+    const from = pads[frog.pad];
+    const to = pads[frog.pad + 1];
+    if (!from || !to) return 0.5;
+    const dx = to.x - frog.x, dy = to.y - frog.y;
+    const disc = HOP_VY * HOP_VY + 2 * GRAV * dy;
+    const t = (-HOP_VY + Math.sqrt(Math.max(1, disc))) / GRAV;
+    const vx = dx / t;
+    return Math.max(0.05, Math.min(1, (vx - HOP_VX_MIN) / (HOP_VX_MAX - HOP_VX_MIN)));
+  }
+};
+</script>
+</body>
+</html>

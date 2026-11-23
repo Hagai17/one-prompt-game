@@ -1,0 +1,1 @@
+Make a one-button game where a tiny frog hops from lily pad to lily pad across a moonlit pond, catching fireflies for points — hold to charge the hop, release to leap, and the run ends the moment it misses a pad and splashes in.
